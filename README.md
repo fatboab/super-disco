@@ -1,2 +1,2 @@
 # super-disco
-Not so super simple MIDI keyboard
+Inspired by [Look Mum No Computer](https://www.lookmumnocomputer.com/projects#/super-simple-midi-keyboard)'s [Super Simple MIDI Keyboard project](https://youtu.be/wY1SRehZ9hM), this is my _Not So Super Simple MIDI Keyboard_. Rather than an Arduino, it'll use a [Raspberry PI Pico](https://www.raspberrypi.com/products/raspberry-pi-pico/) running [MicroPython](https://www.micropython.org/) and [Adafruit NeoPixel arcade buttons](https://learn.adafruit.com/neopixel-arcade-button) rather than plain illuminated one. We might even get round to sticking an OLED screen in there to add the ability to change settings on the fly.
