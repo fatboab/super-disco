@@ -1,77 +1,142 @@
-from machine import Pin, UART
-from midi import Controller
+from machine import Pin
+from rp2 import asm_pio, PIO, StateMachine
+import ustruct
 
 
-class Note:
-    def __init__(self, mask, midi):
-        self.mask = mask
-        self.midi = midi
+# UART settings for sending the MIDI commands.
+UART_BAUD = 31250
+UART_TX_PIN = 0
 
-    def __repr__(self):
-        return '<Note: mask: {mask} midi: {midi}>'.format(
-            mask=self.mask,
-            midi=self.midi
-        )
+# MIDI settings.
+MIDI_CHANNEL = 1
+MIDI_COMMANDS = (
+    0x80,  # Note Off
+    0x90,  # Note On
+)
+MIDI_OCTAVE = 2
 
+# The MIDI note of our first button in octave 0. For us, this is Middle C, or 60.
+BASE_MIDI_NOTE = 60
 
-class Button:
-    def __init__(self, pin, note, initial_state=0):
-        self.pin = pin
-        self.note = note
-        self.state = initial_state
-
-    def __repr__(self):
-        return '<Button: pin: {pin} note: {note} state: {state}>'.format(
-            pin=self.pin,
-            note=self.note,
-            state=self.state
-        )
+# The number of note buttons in the keyboard
+NUM_BUTTONS = 4
 
 
-# MIDI controller, defaults to channel 1...
-midi_tx_pin = UART(0, baudrate=31250, tx=Pin(0))
-controller = Controller(midi_tx_pin)
+@asm_pio(out_init=PIO.OUT_HIGH, out_shiftdir=PIO.SHIFT_RIGHT, sideset_init=PIO.OUT_HIGH)
+def uart_tx():
+    # Block with TX deasserted until data available
+    pull()
+    # Initialise bit counter, assert start bit for 8 cycles
+    set(x, 7)  .side(0)       [7]
+    # Shift out 8 data bits, 8 execution cycles per bit
+    label("bitloop")
+    out(pins, 1)              [6]
+    jmp(x_dec, "bitloop")
+    # Assert stop bit for 8 cycles total (incl 1 for pull())
+    nop()      .side(1)       [6]
 
-# Assume we're using the octave of C4 (middle C), where A4 is 440 Hz. So the MIDI key range is 60 - 71...
-NOTE_C = Note(int('000000000001', 2), 60)
-NOTE_CS = Note(int('000000000010', 2), 61)
-NOTE_D = Note(int('000000000100', 2), 62)
-NOTE_DS = Note(int('000000001000', 2), 63)
-NOTE_E = Note(int('000000010000', 2), 64)
-NOTE_F = Note(int('000000100000', 2), 65)
-NOTE_FS = Note(int('000001000000', 2), 66)
-NOTE_G = Note(int('000010000000', 2), 67)
-NOTE_GS = Note(int('000100000000', 2), 68)
-NOTE_A = Note(int('001000000000', 2), 69)
-NOTE_AS = Note(int('010000000000', 2), 70)
-NOTE_B = Note(int('100000000000', 2), 71)
 
-buttons = [
-    Button(Pin(16, Pin.IN, Pin.PULL_DOWN), NOTE_C),
-    Button(Pin(17, Pin.IN, Pin.PULL_DOWN), NOTE_D),
-    Button(Pin(18, Pin.IN, Pin.PULL_DOWN), NOTE_E),
-    Button(Pin(19, Pin.IN, Pin.PULL_DOWN), NOTE_F)
-]
+@asm_pio(set_init=PIO.OUT_LOW)
+def led_off():
+    """ State machine function to set a pin low. """
+    set(pins, 0)
 
-note_mask = int('000000000000', 2)
 
-led = Pin(25, Pin.OUT)
+@asm_pio(set_init=PIO.OUT_LOW)
+def led_on():
+    """ State machine function to set a pin high. """
+    set(pins, 1)
+
+
+@asm_pio(set_init=(PIO.IN_LOW) * NUM_BUTTONS, in_shiftdir=PIO.SHIFT_LEFT)
+def note_buttons():
+    """ State machine function to read the state of all note buttons at once. """
+    in_(pins, 4)
+    push()
+
+
+def button_changed(mask,  bit) -> int:
+    """Returns the set state of the bit within the bit mask; 1 is set, 0 otherwise"""
+    return (mask >> bit) & 1
+
+
+def determine_midi_command(current_mask, new_mask, bit) -> str:
+    """Given the bit masks of the current and new state of the buttons, determines if we need to issue a note_on or
+    note_off MIDI message for the named bit."""
+    current = button_changed(current_mask, bit)
+    new = button_changed(new_mask, bit)
+
+    return "note_off" if new < current else "note_on"
+
+
+def construct_midi_message(command, data1, data2=0) -> bytes:
+    """Creates a packed ustruct containing the midi message to send via UART."""
+    if command not in MIDI_COMMANDS:
+        raise ValueError("Invalid Command: {}".format(command))
+
+    command += MIDI_CHANNEL - 1
+
+    return ustruct.pack("bbb", command, data1, data2)
+
+
+def apply_octave(note) -> int:
+    if MIDI_OCTAVE not in (-2, -1, 0, 1, 2):
+        raise ValueError("Octave {}, not supported".format(MIDI_OCTAVE))
+
+    return note + (MIDI_OCTAVE * 12)
+
+
+def note_off(note, velocity=0) -> bytes:
+    """Construct a 'Note Off' message"""
+    return construct_midi_message(0x80, apply_octave(note), velocity)
+
+
+def note_on(note, velocity=127) -> bytes:
+    """Construct a 'Note On' message"""
+    return construct_midi_message(0x90, apply_octave(note), velocity)
+
+
+# State machine to write out the MIDI command over UART
+state_machine_1 = StateMachine(1, uart_tx, freq=8 * UART_BAUD, out_base=Pin(UART_TX_PIN, Pin.OUT),
+                               sideset_base=Pin(UART_TX_PIN, Pin.OUT))
+
+# State machine to read the value of all the buttons in a oner...
+state_machine_2 = StateMachine(2, note_buttons, freq=20000, in_base=Pin(9, Pin.IN, Pin.PULL_DOWN))
+
+# Simple dual state machine LED blinking...
+state_machine_3 = StateMachine(5, led_off, freq=20000, set_base=Pin(25))
+state_machine_4 = StateMachine(6, led_on, freq=20002, set_base=Pin(25))
+
+
+state_machine_1.active(1)
+state_machine_2.active(1)
+state_machine_3.active(1)
+state_machine_4.active(0)
+
+current_active_buttons = 0
 
 while True:
-    # Iterate over the buttons...
-    for button in buttons:
-        new_state = button.pin.value()
+    latest_button_state = state_machine_2.get()
 
-        # If the button state has changed, then update the LED state...
-        if button.state != new_state:
-            # Store the new state...
-            button.state = new_state
+    if current_active_buttons != latest_button_state:
+        # print("Input (PIO): {0:04b} ({0})".format(latest_button_state))
 
-            # Update the note mask to indicate teh change in state of this button...
-            note_mask ^= button.note.mask
+        # We only need to know about buttons that have changed state...
+        changed_button_mask = current_active_buttons ^ latest_button_state
+        # print("Changed button mask: {0:04b} ({0})".format(changed_button_mask))
 
-            # Send either an on or off command...
-            controller.note_on(button.note.midi) if button.state else controller.note_off(button.note.midi)
+        for i in range(NUM_BUTTONS):
+            # print("bit {} on - {}".format(i, bool(bit_on(changed_buttons, i))))
+            if button_changed(changed_button_mask, i):
+                midi_command = determine_midi_command(current_active_buttons, latest_button_state, i)
+                # print("Button {} midi message to send - {}".format(i, midi_command))
 
-    # Switch the LED on if any buttons are pressed, switch it off otherwise...
-    led.high() if note_mask else led.low()
+                midi_message = globals()[midi_command](BASE_MIDI_NOTE + i)
+                # print("MIDI message: {}".format(midi_message))
+
+                state_machine_1.put(midi_message)
+
+        # Store the current state of the buttons...
+        current_active_buttons = latest_button_state
+
+    state_machine_4.active(1 if current_active_buttons else 0)
