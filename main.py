@@ -42,9 +42,23 @@ def uart_tx():
 
 @asm_pio(set_init=(PIO.IN_LOW) * NUM_BUTTONS, in_shiftdir=PIO.SHIFT_LEFT)
 def note_buttons():
-    """ State machine function to read the state of all note buttons at once. """
+    """ State machine function to read the state of all note buttons at once."""
+    wrap_target()
+
     in_(pins, 4)
+    mov(x, isr)
+    jmp(x_not_y, "push")
+    jmp("clear_isr")
+
+    label("push")
+    mov(y, x)
     push()
+
+    label("clear_isr")
+    set(x, 0)
+    mov(isr, x)
+
+    wrap()
 
 
 @asm_pio(set_init=PIO.OUT_LOW)
@@ -97,7 +111,7 @@ state_machine_1 = StateMachine(1, uart_tx, freq=8 * UART_BAUD, out_base=Pin(UART
                                sideset_base=Pin(UART_TX_PIN, Pin.OUT))
 
 # State machine to read the value of all the buttons in a oner...
-state_machine_2 = StateMachine(2, note_buttons, freq=20000, in_base=Pin(9, Pin.IN, Pin.PULL_DOWN))
+state_machine_2 = StateMachine(2, note_buttons, freq=2000, in_base=Pin(9, Pin.IN, Pin.PULL_DOWN))
 
 # Simple dual state machine LED blinking...
 state_machine_3 = StateMachine(5, led_off, freq=20000, set_base=Pin(25))
@@ -114,19 +128,20 @@ current_active_buttons = 0
 while True:
     # Set the latest button state and compare it against the last state we have
     latest_button_state = state_machine_2.get()
-    if current_active_buttons != latest_button_state:
-        # Bit shift both last and current states to see what's changed, and in what direction...
-        for i in range(NUM_BUTTONS):
-            # Get the button state from each mask
-            current = button_state_from_mask(current_active_buttons, i)
-            latest = button_state_from_mask(latest_button_state, i)
 
-            # Work out if we need to send a note on or note off command
-            if current ^ latest:
-                midi_message = note_on(BASE_MIDI_NOTE + i) if latest & 1 else note_off(BASE_MIDI_NOTE + i)
-                state_machine_1.put(midi_message)
+    # Bit shift both last and current states to see what's changed, and in what direction
+    for i in range(NUM_BUTTONS):
+        # Get the button state from each mask
+        current = button_state_from_mask(current_active_buttons, i)
+        latest = button_state_from_mask(latest_button_state, i)
 
-        # Store the current state of the buttons...
-        current_active_buttons = latest_button_state
+        # Work out if we need to send a note on or note off command
+        if current ^ latest:
+            midi_message = note_on(BASE_MIDI_NOTE + i) if latest & 1 else note_off(BASE_MIDI_NOTE + i)
+            state_machine_1.put(midi_message)
 
+    # Store the current state of the buttons
+    current_active_buttons = latest_button_state
+
+    # Fiddle the LED if any note is on
     state_machine_4.active(1 if current_active_buttons else 0)
