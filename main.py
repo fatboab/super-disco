@@ -19,12 +19,63 @@ MIDI_OCTAVES = (-2, -1, 0, 1, 2)
 # The MIDI note of our first button in octave 0. For us, this is Middle C, or 60.
 BASE_MIDI_NOTE = 60
 
-# The number of note buttons in the keyboard
-NUM_BUTTONS = 4
+# Two octave buttons
+OCTAVE_BUTTON_DOWN = 9
+OCTAVE_BUTTON_UP = 10
+
+# Note buttons that make up the keyboard
+NOTE_BUTTON_BASE = 11
+NOTE_BUTTON_NUM = 2
+
+
+@asm_pio(set_init=PIO.IN_LOW)
+def handle_octave_down_button():
+    """" State machine to handle the down octave button """
+    wrap_target()
+
+    wait(1, pin, 0)
+    irq(block, rel(0))
+    wait(0, pin, 0)
+    irq(clear, rel(0))
+
+    wrap()
+
+
+@asm_pio(set_init=PIO.IN_LOW)
+def handle_octave_up_button():
+    """" State machine to handle the down octave button """
+    wrap_target()
+
+    wait(1, pin, 0)
+    irq(block, rel(0))
+    wait(0, pin, 0)
+    irq(clear, rel(0))
+
+    wrap()
+
+
+@asm_pio(set_init=(PIO.IN_LOW) * NOTE_BUTTON_NUM, in_shiftdir=PIO.SHIFT_LEFT)
+def handle_note_buttons():
+    """ State machine function to read the state of all note buttons at once."""
+    wrap_target()
+
+    in_(pins, 2)
+    mov(x, isr)
+    jmp(x_not_y, "push")
+    jmp("clear_isr")
+
+    label("push")
+    mov(y, x)
+    push()
+
+    label("clear_isr")
+    set(x, 0)
+    mov(isr, x)
+    wrap()
 
 
 @asm_pio(out_init=PIO.OUT_HIGH, out_shiftdir=PIO.SHIFT_RIGHT, sideset_init=PIO.OUT_HIGH)
-def uart_tx():
+def handle_uart_tx():
     """
     https://github.com/raspberrypi/pico-micropython-examples/blob/master/pio/pio_uart_tx.py
     """
@@ -38,27 +89,6 @@ def uart_tx():
     jmp(x_dec, "bitloop")
     # Assert stop bit for 8 cycles total (incl 1 for pull())
     nop()      .side(1)       [6]
-
-
-@asm_pio(set_init=(PIO.IN_LOW) * NUM_BUTTONS, in_shiftdir=PIO.SHIFT_LEFT)
-def note_buttons():
-    """ State machine function to read the state of all note buttons at once."""
-    wrap_target()
-
-    in_(pins, 4)
-    mov(x, isr)
-    jmp(x_not_y, "push")
-    jmp("clear_isr")
-
-    label("push")
-    mov(y, x)
-    push()
-
-    label("clear_isr")
-    set(x, 0)
-    mov(isr, x)
-
-    wrap()
 
 
 @asm_pio(set_init=PIO.OUT_LOW)
@@ -106,31 +136,64 @@ def note_on(note, velocity=127) -> bytes:
     return construct_midi_message(0x90, apply_octave(note), velocity)
 
 
-# State machine to write out the MIDI command over UART
-state_machine_1 = StateMachine(1, uart_tx, freq=8 * UART_BAUD, out_base=Pin(UART_TX_PIN, Pin.OUT),
-                               sideset_base=Pin(UART_TX_PIN, Pin.OUT))
+def octave_down(_sm):
+    """ IRQ handler for the octave down button """
+    global MIDI_OCTAVE
 
-# State machine to read the value of all the buttons in a oner...
-state_machine_2 = StateMachine(2, note_buttons, freq=2000, in_base=Pin(9, Pin.IN, Pin.PULL_DOWN))
+    new_octave = MIDI_OCTAVE - 1
+    if new_octave not in MIDI_OCTAVES:
+        new_octave = MIDI_OCTAVES[0]
+
+    MIDI_OCTAVE = new_octave
+
+
+def octave_up(_sm):
+    """ IRQ handler for the octave up button """
+    global MIDI_OCTAVE
+
+    new_octave = MIDI_OCTAVE + 1
+    if new_octave not in MIDI_OCTAVES:
+        new_octave = MIDI_OCTAVES[len(MIDI_OCTAVES) - 1]
+
+    MIDI_OCTAVE = new_octave
+
+
+# State machine to drop the notes an octave
+octave_down_sm = StateMachine(1, handle_octave_down_button, freq=2000, in_base=Pin(OCTAVE_BUTTON_DOWN, Pin.IN,
+                                                                                   Pin.PULL_DOWN))
+octave_down_sm.irq(octave_down)
+
+# State machine to drop the notes an octave
+octave_up_sm = StateMachine(2, handle_octave_up_button, freq=2000, in_base=Pin(OCTAVE_BUTTON_UP, Pin.IN, Pin.PULL_DOWN))
+octave_up_sm.irq(octave_up)
+
+# State machine to read the value of all the buttons in a oner
+note_button_sm = StateMachine(3, handle_note_buttons, freq=2000, in_base=Pin(NOTE_BUTTON_BASE, Pin.IN, Pin.PULL_DOWN))
+
+# State machine to write out the MIDI command over UART
+midi_output_sm = StateMachine(4, handle_uart_tx, freq=8 * UART_BAUD, out_base=Pin(UART_TX_PIN, Pin.OUT),
+                              sideset_base=Pin(UART_TX_PIN, Pin.OUT))
+
+# Start all the button related state machines
+octave_down_sm.active(1)
+octave_up_sm.active(1)
+note_button_sm.active(1)
+midi_output_sm.active(1)
 
 # Simple dual state machine LED blinking...
 state_machine_3 = StateMachine(5, led_off, freq=20000, set_base=Pin(25))
-state_machine_4 = StateMachine(6, led_on, freq=20002, set_base=Pin(25))
-
-
-state_machine_1.active(1)
-state_machine_2.active(1)
 state_machine_3.active(1)
+state_machine_4 = StateMachine(6, led_on, freq=20002, set_base=Pin(25))
 state_machine_4.active(0)
 
 current_active_buttons = 0
 
 while True:
     # Set the latest button state and compare it against the last state we have
-    latest_button_state = state_machine_2.get()
+    latest_button_state = note_button_sm.get()
 
     # Bit shift both last and current states to see what's changed, and in what direction
-    for i in range(NUM_BUTTONS):
+    for i in range(NOTE_BUTTON_NUM):
         # Get the button state from each mask
         current = button_state_from_mask(current_active_buttons, i)
         latest = button_state_from_mask(latest_button_state, i)
@@ -138,7 +201,7 @@ while True:
         # Work out if we need to send a note on or note off command
         if current ^ latest:
             midi_message = note_on(BASE_MIDI_NOTE + i) if latest & 1 else note_off(BASE_MIDI_NOTE + i)
-            state_machine_1.put(midi_message)
+            midi_output_sm.put(midi_message)
 
     # Store the current state of the buttons
     current_active_buttons = latest_button_state
