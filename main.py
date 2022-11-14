@@ -36,7 +36,6 @@ def handle_octave_down_button():
     wait(1, pin, 0)
     irq(block, rel(0))
     wait(0, pin, 0)
-    irq(clear, rel(0))
 
     wrap()
 
