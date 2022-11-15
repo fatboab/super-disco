@@ -1,4 +1,5 @@
 from machine import Pin
+from notes import NoteStack
 from rp2 import asm_pio, PIO, StateMachine
 import ustruct
 
@@ -26,6 +27,9 @@ OCTAVE_BUTTON_UP = 10
 # Note buttons that make up the keyboard
 NOTE_BUTTON_BASE = 11
 NOTE_BUTTON_NUM = 2
+
+current_active_buttons = 0
+note_stack = NoteStack(behaviour=NoteStack.BEHAVIOUR_RETRIGGER_LAST)
 
 
 @asm_pio(set_init=PIO.IN_LOW)
@@ -107,6 +111,10 @@ def button_state_from_mask(mask,  bit) -> int:
     return (mask >> bit) & 1
 
 
+def apply_octave(note, octave) -> int:
+    return note + (octave * 12)
+
+
 def construct_midi_message(command, data1, data2=0) -> bytes:
     """Creates a packed ustruct containing the midi message to send via UART."""
     if command not in MIDI_COMMANDS:
@@ -118,43 +126,64 @@ def construct_midi_message(command, data1, data2=0) -> bytes:
     return ustruct.pack("bbb", command, data1, data2)
 
 
-def apply_octave(note) -> int:
-    if MIDI_OCTAVE not in MIDI_OCTAVES:
-        raise ValueError("Octave {}, not supported".format(MIDI_OCTAVE))
-
-    return note + (MIDI_OCTAVE * 12)
-
-
 def note_off(note, velocity=0) -> bytes:
     """Construct a 'Note Off' message"""
-    return construct_midi_message(0x80, apply_octave(note), velocity)
+    return construct_midi_message(0x80, note, velocity)
 
 
 def note_on(note, velocity=127) -> bytes:
     """Construct a 'Note On' message"""
-    return construct_midi_message(0x90, apply_octave(note), velocity)
+    return construct_midi_message(0x90, note, velocity)
+
+
+def retrigger_notes():
+    """
+    Do we need to re-trigger any notes...? I.e. send note off in their current octave and then send a note on in the
+    current octave.
+    :return:
+    """
+    notes = note_stack.notes_to_retrigger()
+    for (note, octave) in notes:
+        # Send the note off
+        midi_message = note_off(apply_octave(note, octave))
+        midi_output_sm.put(midi_message)
+
+        # Send the note on message
+        midi_message = note_on(apply_octave(note, MIDI_OCTAVE))
+        midi_output_sm.put(midi_message)
+
+        # Replace the re-triggered note in the note stack
+        note_stack.replace(note, MIDI_OCTAVE)
 
 
 def octave_down(_sm):
     """ IRQ handler for the octave down button """
     global MIDI_OCTAVE
 
+    # Calculate the new octave
     new_octave = MIDI_OCTAVE - 1
     if new_octave not in MIDI_OCTAVES:
         new_octave = MIDI_OCTAVES[0]
 
-    MIDI_OCTAVE = new_octave
+    if new_octave != MIDI_OCTAVE:
+        # Store the new octave and re-trigger any notes that require it
+        MIDI_OCTAVE = new_octave
+        retrigger_notes()
 
 
 def octave_up(_sm):
     """ IRQ handler for the octave up button """
     global MIDI_OCTAVE
 
+    # Calculate the new octave
     new_octave = MIDI_OCTAVE + 1
     if new_octave not in MIDI_OCTAVES:
         new_octave = MIDI_OCTAVES[len(MIDI_OCTAVES) - 1]
 
-    MIDI_OCTAVE = new_octave
+    if new_octave != MIDI_OCTAVE:
+        # Store the new octave and re-trigger any notes that require it
+        MIDI_OCTAVE = new_octave
+        retrigger_notes()
 
 
 # State machine to drop the notes an octave
@@ -185,8 +214,6 @@ state_machine_3.active(1)
 state_machine_4 = StateMachine(6, led_on, freq=20002, set_base=Pin(25))
 state_machine_4.active(0)
 
-current_active_buttons = 0
-
 while True:
     # Set the latest button state and compare it against the last state we have
     latest_button_state = note_button_sm.get()
@@ -199,8 +226,24 @@ while True:
 
         # Work out if we need to send a note on or note off command
         if current ^ latest:
-            midi_message = note_on(BASE_MIDI_NOTE + i) if latest & 1 else note_off(BASE_MIDI_NOTE + i)
-            midi_output_sm.put(midi_message)
+            # Convenience so we only do the + i in one place...
+            note = BASE_MIDI_NOTE + i
+
+            # Generate a midi message and send it
+            if latest & 1:
+                # Create the MIDI message and send it
+                midi_message = note_on(apply_octave(note, MIDI_OCTAVE))
+                midi_output_sm.put(midi_message)
+
+                # Add the note details to the note stack
+                note_stack.add(note, MIDI_OCTAVE)
+            else:
+                # Remove the note details to the note stack
+                removed = note_stack.remove(note)
+
+                # Create the MIDI message and send it, don't assume we're still in the same octave
+                midi_message = note_off(apply_octave(removed.note, removed.octave))
+                midi_output_sm.put(midi_message)
 
     # Store the current state of the buttons
     current_active_buttons = latest_button_state
