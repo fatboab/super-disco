@@ -23,21 +23,20 @@ MIDI_OCTAVES = (-2, -1, 0, 1, 2)
 BASE_MIDI_NOTE = 60
 
 # Two octave buttons
-OCTAVE_BUTTON_DOWN = 9
-OCTAVE_BUTTON_UP = 10
+OCTAVE_BUTTON_UP = 9
+OCTAVE_BUTTON_DOWN = 10
 
 # Note buttons that make up the keyboard
 NOTE_BUTTON_BASE = 11
-NOTE_BUTTON_NUM = 2
+NOTE_BUTTON_NUM = 12
 
 # NeoPixels for that bit of pizzazz
-TMP_NEO_PIXEL_NUM = 12 # ::TODO:: Remove
 NEO_PIXEL_PIN = 8
-NEO_PIXEL_BRIGHTNESS = 0.2
-NEO_PIXEL_OCTAVE_DOWN = 0
-NEO_PIXEL_OCTAVE_UP = 1
-NEO_PIXEL_NOTES = 2
-NEO_PIXELS = array("I", [0 for _ in range(TMP_NEO_PIXEL_NUM)])
+NEO_PIXEL_BRIGHTNESS = 0.5
+NEO_PIXEL_OCTAVE_UP = 0
+NEO_PIXEL_OCTAVE_DOWN = 1
+NEO_PIXEL_NOTES_START = 2
+NEO_PIXELS = array("I", [0 for _ in range(NOTE_BUTTON_NUM + 2)])    # 14 buttons in total...
 
 # Colours
 OCTAVE_COLOURS = [
@@ -82,7 +81,7 @@ def handle_note_buttons():
     """ State machine function to read the state of all note buttons at once."""
     wrap_target()
 
-    in_(pins, 2)
+    in_(pins, 12)
     mov(x, isr)
     jmp(x_not_y, "push")
     jmp("clear_isr")
@@ -136,18 +135,6 @@ def handle_neo_pixels():
     wrap()
 
 
-@asm_pio(set_init=PIO.OUT_LOW)
-def led_off():
-    """ State machine function to set a pin low. """
-    set(pins, 0)
-
-
-@asm_pio(set_init=PIO.OUT_LOW)
-def led_on():
-    """ State machine function to set a pin high. """
-    set(pins, 1)
-
-
 def button_state_from_mask(mask,  bit) -> int:
     """Returns the set state of the bit within the bit mask; 1 is set, 0 otherwise"""
     return (mask >> bit) & 1
@@ -198,6 +185,16 @@ def retrigger_notes():
         note_stack.replace(note, MIDI_OCTAVE)
 
 
+def octave_down_colour():
+    octave_exists = MIDI_OCTAVE - 1
+    return OCTAVE_COLOURS[octave_exists + 2] if octave_exists in MIDI_OCTAVES else (0, 0, 0)
+
+
+def octave_up_colour():
+    octave_exists = MIDI_OCTAVE + 1
+    return OCTAVE_COLOURS[octave_exists + 2] if octave_exists in MIDI_OCTAVES else (0, 0, 0)
+
+
 def octave_down(_sm):
     """ IRQ handler for the octave down button """
     global MIDI_OCTAVE
@@ -209,12 +206,14 @@ def octave_down(_sm):
 
     if new_octave != MIDI_OCTAVE:
         # Change colour
-        pixels_fill(OCTAVE_COLOURS[new_octave + 2])
+        pixels_fill_notes(OCTAVE_COLOURS[new_octave + 2])
         pixels_show()
 
-        # Store the new octave and re-trigger any notes that require it
+        # Store the new octave, re-trigger any notes that require it and change the NeoPixels
         MIDI_OCTAVE = new_octave
         retrigger_notes()
+        pixels_fill_octaves(octave_down_colour(), octave_up_colour())
+        pixels_show()
 
 
 def octave_up(_sm):
@@ -228,17 +227,19 @@ def octave_up(_sm):
 
     if new_octave != MIDI_OCTAVE:
         # Change colour
-        pixels_fill(OCTAVE_COLOURS[new_octave + 2])
+        pixels_fill_notes(OCTAVE_COLOURS[new_octave + 2])
         pixels_show()
 
-        # Store the new octave and re-trigger any notes that require it
+        # Store the new octave, re-trigger any notes that require it and change the NeoPixels
         MIDI_OCTAVE = new_octave
         retrigger_notes()
+        pixels_fill_octaves(octave_down_colour(), octave_up_colour())
+        pixels_show()
 
 
 def pixels_show():
     # Create a new array and fill it with the same colours, just less bright...
-    dimmer_ar = array("I", [0 for _ in range(TMP_NEO_PIXEL_NUM)])
+    dimmer_ar = array("I", [0 for _ in range(len(NEO_PIXELS))])
     for i, c in enumerate(NEO_PIXELS):
         r = int(((c >> 8) & 0xFF) * NEO_PIXEL_BRIGHTNESS)
         g = int(((c >> 16) & 0xFF) * NEO_PIXEL_BRIGHTNESS)
@@ -253,8 +254,13 @@ def pixels_set(neo_pixel_index, color):
     NEO_PIXELS[neo_pixel_index] = (color[1] << 16) + (color[0] << 8) + color[2]
 
 
-def pixels_fill(colour):
-    for i in range(len(NEO_PIXELS)):
+def pixels_fill_octaves(down_colour, up_colour):
+    pixels_set(NEO_PIXEL_OCTAVE_DOWN, down_colour)
+    pixels_set(NEO_PIXEL_OCTAVE_UP, up_colour)
+
+
+def pixels_fill_notes(colour):
+    for i in range(NEO_PIXEL_NOTES_START, (NOTE_BUTTON_NUM + NEO_PIXEL_NOTES_START)):
         pixels_set(i, colour)
 
 
@@ -284,15 +290,9 @@ note_button_sm.active(1)
 midi_output_sm.active(1)
 neo_pixel_sm.active(1)
 
-# Simple dual state machine LED blinking...
-# ::TODO:: Remove when the NeoPixels are working...
-state_machine_3 = StateMachine(6, led_off, freq=20000, set_base=Pin(25))
-state_machine_3.active(1)
-state_machine_4 = StateMachine(7, led_on, freq=20002, set_base=Pin(25))
-state_machine_4.active(0)
-
 # Initialise the NeoPixels...
-pixels_fill(OCTAVE_COLOURS[MIDI_OCTAVE + 2])
+pixels_fill_octaves(octave_down_colour(), octave_up_colour())
+pixels_fill_notes(OCTAVE_COLOURS[MIDI_OCTAVE + 2])
 pixels_show()
 
 while True:
@@ -328,6 +328,3 @@ while True:
 
     # Store the current state of the buttons
     current_active_buttons = latest_button_state
-
-    # Fiddle the LED if any note is on
-    state_machine_4.active(1 if current_active_buttons else 0)
