@@ -1,7 +1,9 @@
 from machine import Pin
 from notes import NoteStack
 from rp2 import asm_pio, PIO, StateMachine
-import ustruct
+from uarray import array
+from ustruct import pack
+from utime import sleep_ms
 
 
 # UART settings for sending the MIDI commands.
@@ -21,12 +23,29 @@ MIDI_OCTAVES = (-2, -1, 0, 1, 2)
 BASE_MIDI_NOTE = 60
 
 # Two octave buttons
-OCTAVE_BUTTON_DOWN = 9
-OCTAVE_BUTTON_UP = 10
+OCTAVE_BUTTON_UP = 9
+OCTAVE_BUTTON_DOWN = 10
 
 # Note buttons that make up the keyboard
 NOTE_BUTTON_BASE = 11
 NOTE_BUTTON_NUM = 12
+
+# NeoPixels for that bit of pizzazz
+NEO_PIXEL_PIN = 8
+NEO_PIXEL_BRIGHTNESS = 0.5
+NEO_PIXEL_OCTAVE_UP = 0
+NEO_PIXEL_OCTAVE_DOWN = 1
+NEO_PIXEL_NOTES_START = 2
+NEO_PIXELS = array("I", [0 for _ in range(NOTE_BUTTON_NUM + 2)])    # 14 buttons in total...
+
+# Colours
+OCTAVE_COLOURS = [
+    (27, 158, 119),
+    (217, 95, 2),
+    (117, 112, 179),
+    (231, 41, 138),
+    (102, 166, 30)
+]
 
 current_active_buttons = 0
 note_stack = NoteStack(behaviour=NoteStack.BEHAVIOUR_RETRIGGER_LAST)
@@ -94,16 +113,26 @@ def handle_uart_tx():
     nop()      .side(1)       [6]
 
 
-@asm_pio(set_init=PIO.OUT_LOW)
-def led_off():
-    """ State machine function to set a pin low. """
-    set(pins, 0)
+@asm_pio(sideset_init=PIO.OUT_LOW, out_shiftdir=PIO.SHIFT_LEFT, autopull=True, pull_thresh=24)
+def handle_neo_pixels():
+    """
+    https://github.com/raspberrypi/pico-micropython-examples/blob/master/pio/pio_ws2812.py
+    """
+    T1 = 2
+    T2 = 5
+    T3 = 3
 
+    wrap_target()
 
-@asm_pio(set_init=PIO.OUT_LOW)
-def led_on():
-    """ State machine function to set a pin high. """
-    set(pins, 1)
+    label("bitloop")
+    out(x, 1)               .side(0)    [T3 - 1]
+    jmp(not_x, "do_zero")   .side(1)    [T1 - 1]
+    jmp("bitloop")          .side(1)    [T2 - 1]
+
+    label("do_zero")
+    nop()                   .side(0)    [T2 - 1]
+
+    wrap()
 
 
 def button_state_from_mask(mask,  bit) -> int:
@@ -123,7 +152,7 @@ def construct_midi_message(command, data1, data2=0) -> bytes:
     # Change the channel if necessary...
     command += MIDI_CHANNEL - 1
 
-    return ustruct.pack("bbb", command, data1, data2)
+    return pack("bbb", command, data1, data2)
 
 
 def note_off(note, velocity=0) -> bytes:
@@ -156,6 +185,16 @@ def retrigger_notes():
         note_stack.replace(note, MIDI_OCTAVE)
 
 
+def octave_down_colour():
+    octave_exists = MIDI_OCTAVE - 1
+    return OCTAVE_COLOURS[octave_exists + 2] if octave_exists in MIDI_OCTAVES else (0, 0, 0)
+
+
+def octave_up_colour():
+    octave_exists = MIDI_OCTAVE + 1
+    return OCTAVE_COLOURS[octave_exists + 2] if octave_exists in MIDI_OCTAVES else (0, 0, 0)
+
+
 def octave_down(_sm):
     """ IRQ handler for the octave down button """
     global MIDI_OCTAVE
@@ -166,9 +205,15 @@ def octave_down(_sm):
         new_octave = MIDI_OCTAVES[0]
 
     if new_octave != MIDI_OCTAVE:
-        # Store the new octave and re-trigger any notes that require it
+        # Change colour
+        pixels_fill_notes(OCTAVE_COLOURS[new_octave + 2])
+        pixels_show()
+
+        # Store the new octave, re-trigger any notes that require it and change the NeoPixels
         MIDI_OCTAVE = new_octave
         retrigger_notes()
+        pixels_fill_octaves(octave_down_colour(), octave_up_colour())
+        pixels_show()
 
 
 def octave_up(_sm):
@@ -181,53 +226,89 @@ def octave_up(_sm):
         new_octave = MIDI_OCTAVES[len(MIDI_OCTAVES) - 1]
 
     if new_octave != MIDI_OCTAVE:
-        # Store the new octave and re-trigger any notes that require it
+        # Change colour
+        pixels_fill_notes(OCTAVE_COLOURS[new_octave + 2])
+        pixels_show()
+
+        # Store the new octave, re-trigger any notes that require it and change the NeoPixels
         MIDI_OCTAVE = new_octave
         retrigger_notes()
+        pixels_fill_octaves(octave_down_colour(), octave_up_colour())
+        pixels_show()
+
+
+def pixels_show():
+    # Create a new array and fill it with the same colours, just less bright...
+    dimmer_ar = array("I", [0 for _ in range(len(NEO_PIXELS))])
+    for i, c in enumerate(NEO_PIXELS):
+        r = int(((c >> 8) & 0xFF) * NEO_PIXEL_BRIGHTNESS)
+        g = int(((c >> 16) & 0xFF) * NEO_PIXEL_BRIGHTNESS)
+        b = int((c & 0xFF) * NEO_PIXEL_BRIGHTNESS)
+        dimmer_ar[i] = (g << 16) + (r << 8) + b
+
+    neo_pixel_sm.put(dimmer_ar, 8)
+    sleep_ms(10)
+
+
+def pixels_set(neo_pixel_index, color):
+    NEO_PIXELS[neo_pixel_index] = (color[1] << 16) + (color[0] << 8) + color[2]
+
+
+def pixels_fill_octaves(down_colour, up_colour):
+    pixels_set(NEO_PIXEL_OCTAVE_DOWN, down_colour)
+    pixels_set(NEO_PIXEL_OCTAVE_UP, up_colour)
+
+
+def pixels_fill_notes(colour):
+    for i in range(NEO_PIXEL_NOTES_START, (NOTE_BUTTON_NUM + NEO_PIXEL_NOTES_START)):
+        pixels_set(i, colour)
 
 
 # State machine to drop the notes an octave
-octave_down_sm = StateMachine(1, handle_octave_down_button, freq=2000, in_base=Pin(OCTAVE_BUTTON_DOWN, Pin.IN,
+octave_down_sm = StateMachine(0, handle_octave_down_button, freq=2000, in_base=Pin(OCTAVE_BUTTON_DOWN, Pin.IN,
                                                                                    Pin.PULL_DOWN))
 octave_down_sm.irq(octave_down)
 
 # State machine to drop the notes an octave
-octave_up_sm = StateMachine(2, handle_octave_up_button, freq=2000, in_base=Pin(OCTAVE_BUTTON_UP, Pin.IN, Pin.PULL_DOWN))
+octave_up_sm = StateMachine(1, handle_octave_up_button, freq=2000, in_base=Pin(OCTAVE_BUTTON_UP, Pin.IN, Pin.PULL_DOWN))
 octave_up_sm.irq(octave_up)
 
 # State machine to read the value of all the buttons in a oner
-note_button_sm = StateMachine(3, handle_note_buttons, freq=2000, in_base=Pin(NOTE_BUTTON_BASE, Pin.IN, Pin.PULL_DOWN))
+note_button_sm = StateMachine(2, handle_note_buttons, freq=2000, in_base=Pin(NOTE_BUTTON_BASE, Pin.IN, Pin.PULL_DOWN))
 
 # State machine to write out the MIDI command over UART
-midi_output_sm = StateMachine(4, handle_uart_tx, freq=8 * UART_BAUD, out_base=Pin(UART_TX_PIN, Pin.OUT),
+midi_output_sm = StateMachine(3, handle_uart_tx, freq=8 * UART_BAUD, out_base=Pin(UART_TX_PIN, Pin.OUT),
                               sideset_base=Pin(UART_TX_PIN, Pin.OUT))
+
+# StateMachine for controlling all the NeoPixels
+neo_pixel_sm = StateMachine(4, handle_neo_pixels, freq=8_000_000, sideset_base=Pin(NEO_PIXEL_PIN))
 
 # Start all the button related state machines
 octave_down_sm.active(1)
 octave_up_sm.active(1)
 note_button_sm.active(1)
 midi_output_sm.active(1)
+neo_pixel_sm.active(1)
 
-# Simple dual state machine LED blinking...
-state_machine_3 = StateMachine(5, led_off, freq=20000, set_base=Pin(25))
-state_machine_3.active(1)
-state_machine_4 = StateMachine(6, led_on, freq=20002, set_base=Pin(25))
-state_machine_4.active(0)
+# Initialise the NeoPixels...
+pixels_fill_octaves(octave_down_colour(), octave_up_colour())
+pixels_fill_notes(OCTAVE_COLOURS[MIDI_OCTAVE + 2])
+pixels_show()
 
 while True:
     # Set the latest button state and compare it against the last state we have
     latest_button_state = note_button_sm.get()
 
     # Bit shift both last and current states to see what's changed, and in what direction
-    for i in range(NOTE_BUTTON_NUM):
+    for button_index in range(NOTE_BUTTON_NUM):
         # Get the button state from each mask
-        current = button_state_from_mask(current_active_buttons, i)
-        latest = button_state_from_mask(latest_button_state, i)
+        current = button_state_from_mask(current_active_buttons, button_index)
+        latest = button_state_from_mask(latest_button_state, button_index)
 
         # Work out if we need to send a note on or note off command
         if current ^ latest:
             # Convenience so we only do the + i in one place...
-            note = BASE_MIDI_NOTE + i
+            note = BASE_MIDI_NOTE + button_index
 
             # Generate a midi message and send it
             if latest & 1:
@@ -247,6 +328,3 @@ while True:
 
     # Store the current state of the buttons
     current_active_buttons = latest_button_state
-
-    # Fiddle the LED if any note is on
-    state_machine_4.active(1 if current_active_buttons else 0)
