@@ -26,7 +26,7 @@ OCTAVE_BUTTON_UP = 10
 
 # Note buttons that make up the keyboard
 NOTE_BUTTON_BASE = 11
-NOTE_BUTTON_NUM = 2
+NOTE_BUTTON_NUM = 12
 
 current_active_buttons = 0
 note_stack = NoteStack(behaviour=NoteStack.BEHAVIOUR_RETRIGGER_LAST)
@@ -62,7 +62,7 @@ def handle_note_buttons():
     """ State machine function to read the state of all note buttons at once."""
     wrap_target()
 
-    in_(pins, 2)
+    in_(pins, 12)
     mov(x, isr)
     jmp(x_not_y, "push")
     jmp("clear_isr")
